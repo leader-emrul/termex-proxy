@@ -2,6 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const qs = require('querystring');
+const crypto = require('crypto');
+
+function md5(str) {
+  return crypto.createHash('md5').update(str).digest('hex').toUpperCase();
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,19 +14,19 @@ const PORT = process.env.PORT || 3000;
 const APP_ID = '100067';
 const LOCALE = 'en_BD';
 const REGION = 'BD';
-
-// Screenshot থেকে exact User-Agent
 const USER_AGENT = 'GarenaMSDK/4.0.32 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.6099.193 Mobile Safari/537.36';
+
+// verifier_token সাময়িকভাবে মনে রাখবে (email → token)
+const tokenStore = {};
 
 app.use(cors());
 app.use(express.json());
 
 function log(route, status, msg) {
-  const time = new Date().toISOString();
-  console.log(`[${time}] ${route} → ${status} | ${msg}`);
+  console.log(`[${new Date().toISOString()}] ${route} → ${status} | ${msg}`);
 }
 
-function makeHeaders(extraHeaders = {}) {
+function makeHeaders() {
   return {
     'Host': 'ffmconnect.ppmainecoonghj.com',
     'Content-Type': 'application/x-www-form-urlencoded',
@@ -33,29 +38,21 @@ function makeHeaders(extraHeaders = {}) {
     'X-Requested-With': 'com.dts.freefiremax',
     'Origin': 'https://100067.connect.garena.com',
     'Referer': 'https://100067.connect.garena.com/',
-    ...extraHeaders
   };
 }
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'TERMEX Proxy running', version: '3.0', time: new Date().toISOString() });
+  res.json({ status: 'TERMEX Proxy running', version: '4.0' });
 });
 
-// API 1: Send OTP
+// API 1: Send OTP — verifier_token save করে রাখে
 app.post('/send-otp', async (req, res) => {
   const { email, access_token } = req.body;
   if (!email || !access_token) {
     return res.status(400).json({ result: -1, error: 'email এবং access_token দরকার' });
   }
   try {
-    const bodyData = qs.stringify({
-      email,
-      locale: LOCALE,
-      region: REGION,
-      app_id: APP_ID,
-      access_token
-    });
+    const bodyData = qs.stringify({ email, locale: LOCALE, region: REGION, app_id: APP_ID, access_token });
     const response = await fetch(
       'https://ffmconnect.ppmainecoonghj.com/game/account_security/bind:send_otp',
       { method: 'POST', headers: makeHeaders(), body: bodyData }
@@ -64,9 +61,17 @@ app.post('/send-otp', async (req, res) => {
     let data;
     try { data = JSON.parse(text); } catch(e) { data = { raw: text }; }
     log('/send-otp', response.status, email);
+
     if (response.status === 403) {
-      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true, raw: text });
+      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true });
     }
+
+    // verifier_token পেলে server-এ save করো
+    if (data && data.verifier_token) {
+      tokenStore[email] = data.verifier_token;
+      log('/send-otp', 'SAVED verifier_token', email);
+    }
+
     res.status(response.status).json(data);
   } catch (err) {
     log('/send-otp', 'ERR', err.message);
@@ -81,12 +86,7 @@ app.post('/verify-otp', async (req, res) => {
     return res.status(400).json({ result: -1, error: 'email, otp এবং access_token দরকার' });
   }
   try {
-    const bodyData = qs.stringify({
-      email,
-      otp,
-      app_id: APP_ID,
-      access_token
-    });
+    const bodyData = qs.stringify({ email, otp, app_id: APP_ID, access_token });
     const response = await fetch(
       'https://ffmconnect.ppmainecoonghj.com/game/account_security/bind:verify_otp',
       { method: 'POST', headers: makeHeaders(), body: bodyData }
@@ -95,9 +95,11 @@ app.post('/verify-otp', async (req, res) => {
     let data;
     try { data = JSON.parse(text); } catch(e) { data = { raw: text }; }
     log('/verify-otp', response.status, email);
+
     if (response.status === 403) {
-      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true, raw: text });
+      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true });
     }
+
     res.status(response.status).json(data);
   } catch (err) {
     log('/verify-otp', 'ERR', err.message);
@@ -105,16 +107,23 @@ app.post('/verify-otp', async (req, res) => {
   }
 });
 
-// API 3: Create Bind
+// API 3: Create Bind — server নিজেই verifier_token যোগ করে
 app.post('/create-bind', async (req, res) => {
-  const { email, secondary_password, verifier_token, access_token } = req.body;
-  if (!email || !secondary_password || !verifier_token || !access_token) {
-    return res.status(400).json({ result: -1, error: 'সব field দরকার' });
+  const { email, secondary_password, access_token } = req.body;
+  if (!email || !secondary_password || !access_token) {
+    return res.status(400).json({ result: -1, error: 'email, secondary_password এবং access_token দরকার' });
   }
+
+  // server থেকে verifier_token নাও
+  const verifier_token = tokenStore[email];
+  if (!verifier_token) {
+    return res.status(400).json({ result: -1, error: 'verifier_token নেই। আবার OTP পাঠান।' });
+  }
+
   try {
     const bodyData = qs.stringify({
       email,
-      secondary_password,
+      secondary_password: md5(secondary_password),
       app_id: APP_ID,
       verifier_token,
       access_token
@@ -127,9 +136,16 @@ app.post('/create-bind', async (req, res) => {
     let data;
     try { data = JSON.parse(text); } catch(e) { data = { raw: text }; }
     log('/create-bind', response.status, email);
+
     if (response.status === 403) {
-      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true, raw: text });
+      return res.status(403).json({ result: -1, error: 'DataDome block.', datadome: true });
     }
+
+    // সফল হলে tokenStore থেকে মুছে দাও
+    if (data && data.result === 0) {
+      delete tokenStore[email];
+    }
+
     res.status(response.status).json(data);
   } catch (err) {
     log('/create-bind', 'ERR', err.message);
@@ -138,5 +154,5 @@ app.post('/create-bind', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`TERMEX Proxy v3.0 running on port ${PORT}`);
+  console.log(`TERMEX Proxy v4.0 running on port ${PORT}`);
 });
